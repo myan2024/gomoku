@@ -98,3 +98,18 @@ $('leave').onclick = () => {
     await navigator.clipboard.writeText(link); $('hint').textContent = '已复制邀请链接：' + link;
   } catch { $('hint').textContent = '复制失败，请检查浏览器剪贴板权限。'; }
 };
+
+$('feedbackOpen').onclick = () => { $('feedbackStatus').textContent = ''; $('feedbackDialog').showModal(); };
+$('feedbackClose').onclick = () => $('feedbackDialog').close();
+$('feedbackSend').onclick = async () => {
+  const message = $('feedbackMessage').value.trim();
+  if (message.length < 3) { $('feedbackStatus').textContent = '请写至少 3 个字。'; return; }
+  $('feedbackSend').disabled = true; $('feedbackStatus').textContent = '正在发送…';
+  try {
+    const response = await fetch('/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ category: $('feedbackCategory').value, message, contact: $('feedbackContact').value.trim(), website: $('feedbackWebsite').value }) });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || '发送失败，请稍后再试。');
+    $('feedbackStatus').textContent = '感谢反馈，已成功发送！'; $('feedbackMessage').value = ''; $('feedbackContact').value = '';
+  } catch (error) { $('feedbackStatus').textContent = error.message || '发送失败，请稍后再试。'; }
+  finally { $('feedbackSend').disabled = false; }
+};

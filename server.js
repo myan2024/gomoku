@@ -8,8 +8,46 @@ const { Server } = require('socket.io');
 const games = new Map(), SIZE = 15;
 const difficulties = { easy: '简单', medium: '中等', master: '大师' };
 const freshGame = () => ({ board: Array(SIZE * SIZE).fill(0), moves: [], turn: 1, phase: 'rolling', status: 'playing', winner: 0, dice: [null, null], rollMessage: '', undo: null, restartSeat: null });
-const server = http.createServer((req, res) => {
+const feedbackRate = new Map();
+function sendJson(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(body)); }
+async function handleFeedback(req, res) {
+  let raw = '';
+  try {
+    for await (const chunk of req) {
+      raw += chunk;
+      if (Buffer.byteLength(raw) > 6000) return sendJson(res, 413, { ok: false, error: '反馈内容太长。' });
+    }
+    const data = JSON.parse(raw || '{}');
+    if (String(data.website || '').trim()) return sendJson(res, 200, { ok: true });
+    const message = String(data.message || '').trim();
+    if (message.length < 3 || message.length > 2000) return sendJson(res, 400, { ok: false, error: '请填写 3 到 2000 个字的建议。' });
+    const categories = { bug: '问题反馈', idea: '功能建议', other: '其他' };
+    const category = categories[data.category] || categories.other;
+    const contact = String(data.contact || '').trim().slice(0, 254);
+    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+    const now = Date.now(), recent = (feedbackRate.get(ip) || []).filter(time => now - time < 10 * 60 * 1000);
+    if (recent.length >= 5) return sendJson(res, 429, { ok: false, error: '提交太频繁，请稍后再试。' });
+    recent.push(now); feedbackRate.set(ip, recent);
+    const apiKey = process.env.RESEND_API_KEY, to = process.env.FEEDBACK_TO_EMAIL, from = process.env.FEEDBACK_FROM_EMAIL;
+    if (!apiKey || !to || !from) return sendJson(res, 503, { ok: false, error: '反馈邮件尚未配置。' });
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], subject: `[五子棋反馈] ${category}`, text: `${category}\n\n${message}${contact ? `\n\n回信联系：${contact}` : ''}\n\n时间：${new Date().toISOString()}` })
+    });
+    if (!response.ok) { console.error('Feedback email service returned', response.status); return sendJson(res, 502, { ok: false, error: '邮件发送失败，请稍后重试。' }); }
+    return sendJson(res, 200, { ok: true });
+  } catch (error) {
+    if (error instanceof SyntaxError) return sendJson(res, 400, { ok: false, error: '提交内容格式不正确。' });
+    console.error('Feedback submission failed:', error.message);
+    return sendJson(res, 500, { ok: false, error: '提交失败，请稍后重试。' });
+  }
+}
+const server = http.createServer(async (req, res) => {
   const pathname = new URL(req.url, 'http://localhost').pathname;
+  if (pathname === '/api/feedback') {
+    if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'Method not allowed' });
+    return handleFeedback(req, res);
+  }
   if (pathname === '/api/addresses') {
     const ips = Object.values(os.networkInterfaces()).flat().filter(v => v && !v.internal && v.family === 'IPv4').map(v => v.address);
     res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(ips)); return;
