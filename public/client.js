@@ -44,10 +44,20 @@ function render() {
     board.append(cell);
   }
   $('lastMove').textContent = lastMove ? `最近落子：${lastMove.color === 1 ? '黑棋' : '白棋'} · 第 ${lastMove.y + 1} 行，第 ${lastMove.x + 1} 列` : '尚无落子';
+  const notice = $('gameNotice');
+  if (game.phase === 'finished') {
+    notice.classList.remove('hidden', 'draw', 'left');
+    if (game.status === 'draw') { notice.textContent = '平局！'; notice.classList.add('draw'); }
+    else if (game.status === 'left') { notice.textContent = '对方已离开房间，本局结束。'; notice.classList.add('left'); }
+    else { const winner = game.players.find(player => player?.color === game.winner); const side = game.winner === 1 ? '黑棋' : '白棋'; notice.textContent = (winner?.name || side) + '（' + side + '）获胜！'; }
+  } else { notice.classList.add('hidden'); notice.textContent = ''; }
   game.players.forEach((player, index) => {
     const el = $('p' + (index + 1));
     el.textContent = `玩家 ${index + 1}：${player?.name || '等待加入'}${player ? (player.connected ? '' : '（暂时离线）') : ''}　🎲 ${game.dice[index] ?? '未掷'}${player?.color === 1 ? '　黑棋' : player?.color === 2 ? '　白棋' : ''}`;
   });
+  const botSlotOpen = !game.players[1];
+  $('botDifficulty').classList.toggle('hidden', !botSlotOpen);
+  $('botJoin').classList.toggle('hidden', !botSlotOpen);
   $('roll').classList.toggle('hidden', game.phase !== 'rolling');
   $('roll').disabled = game.phase !== 'rolling' || game.players.some(p => !p?.connected) || game.dice[mySeat - 1] !== null;
   $('undo').classList.toggle('hidden', game.phase !== 'playing');
@@ -55,10 +65,14 @@ function render() {
   if (game.phase === 'rolling') {
     const bothHere = game.players.every(p => p?.connected);
     $('status').textContent = !bothHere ? '等待另一位玩家加入' : game.rollMessage || (game.dice[mySeat - 1] !== null ? `你掷出 ${game.dice[mySeat - 1]} 点，等待对方` : '请掷骰，点数大者执黑先手');
-  } else $('status').textContent = $('turn').textContent;
+  } else $('status').textContent = game.status === 'left' ? '对方已离开房间' : $('turn').textContent;
   $('hint').textContent = game.undo ? (game.undo === myColor ? '悔棋请求已发送，等待回应' : '对方请求悔棋') : '';
   if (game.undo && game.undo !== myColor) ask('undo', '对方请求悔棋', '是否撤销最近一步？');
 }
+$('botJoin').onclick = () => socket.timeout(3000).emit('bot:join', $('botDifficulty').value, (error, result) => {
+  if (error) $('hint').textContent = '服务器未响应机器人邀请，请关闭旧服务器窗口并重新启动。';
+  else if (!result?.ok) $('hint').textContent = result.error;
+});
 $('roll').onclick = () => socket.emit('roll');
 function ask(kind, title, body) { if (asking === kind) return; asking = kind; $('dt').textContent = title; $('db').textContent = body; $('dlg').showModal(); }
 function reply(accept) { if (asking === 'undo') socket.emit('undo:reply', accept); else if (asking === 'restart') socket.emit('restart:reply', accept); asking = ''; $('dlg').close(); }
@@ -66,7 +80,15 @@ $('yes').onclick = () => reply(true); $('no').onclick = () => reply(false);
 $('undo').onclick = () => socket.emit('undo:req'); $('restart').onclick = () => socket.emit('restart:req');
 socket.on('restart:ask', seat => { if (seat !== mySeat) ask('restart', '对方请求重新开局', '同意后将重新掷骰决定黑棋。'); });
 $('resign').onclick = () => { if (confirm('确定认输吗？')) socket.emit('resign'); };
-$('copy').onclick = async () => {
+$('leave').onclick = () => {
+  if (!confirm('确定退出房间吗？退出后当前棋局将结束。')) return;
+  socket.emit('leave', () => {
+    localStorage.removeItem('gomoku.session'); mySeat = 0; myColor = 0; game = null; asking = '';
+    if ($('dlg').open) $('dlg').close();
+    $('game').classList.add('hidden'); $('lobby').classList.remove('hidden'); $('codeIn').value = '';
+    history.replaceState(null, '', location.pathname); $('err').textContent = '';
+  });
+};$('copy').onclick = async () => {
   try {
     let link;
     if (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname === '::1') {
