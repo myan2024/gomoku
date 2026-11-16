@@ -4,6 +4,7 @@ const path = require('path');
 const os = require('os');
 const { randomInt } = require('crypto');
 const { Server } = require('socket.io');
+const boardGames = require('./game-rules');
 
 const games = new Map(), SIZE = 15;
 const difficulties = { easy: '简单', medium: '中等', master: '大师' };
@@ -61,7 +62,7 @@ const server = http.createServer(async (req, res) => {
   });
 });
 const io = new Server(server);
-function snapshot(room) { return { code: room.code, players: room.players.map(p => p && { name: p.name, color: p.color, seat: p.seat, connected: !!p.bot || !!p.id, bot: !!p.bot }), botDifficulty: room.botDifficulty || null, ...room.game }; }
+function snapshot(room) { return { code: room.code, gameType: room.gameType || 'gomoku', players: room.players.map(p => p && { name: p.name, color: p.color, seat: p.seat, connected: !!p.bot || !!p.id, bot: !!p.bot }), botDifficulty: room.botDifficulty || null, ...room.game }; }
 function emitState(room) { io.to(room.code).emit('state', snapshot(room)); }
 function winAt(board, x, y, color) {
   for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
@@ -72,9 +73,9 @@ function winAt(board, x, y, color) {
   return false;
 }
 function setColor(room, player, color) { player.color = color; const client = player.id && io.sockets.sockets.get(player.id); if (client) client.data.color = color; }
-function startDiceRound(room) { room.players.forEach(player => player && setColor(room, player, 0)); room.game = freshGame(); }
+function startDiceRound(room) { room.players.forEach(player => player && setColor(room, player, 0)); room.undoStack = []; room.game = room.gameType === 'gomoku' ? freshGame() : boardGames.createBoard(room.gameType); }
 function finishMove(room, x, y, color) {
-  const g = room.game; g.board[y * SIZE + x] = color; g.moves.push({ x, y, color });
+  const g = room.game; room.undoStack.push(structuredClone(g)); g.board[y * SIZE + x] = color; g.moves.push({ x, y, color });
   if (winAt(g.board, x, y, color)) { g.status = 'won'; g.phase = 'finished'; g.winner = color; }
   else if (g.moves.length === SIZE * SIZE) { g.status = 'draw'; g.phase = 'finished'; }
   else g.turn = 3 - color;
@@ -153,6 +154,18 @@ function scheduleBot(room) {
     if (room.game.phase !== 'playing' || room.game.status !== 'playing') return;
     const bot = room.players.find(p => p?.bot);
     if (!bot || room.game.turn !== bot.color) return;
+    if (room.gameType === 'xiangqi') { const move = boardGames.chooseXiangqiMove(room.game, bot.color, room.botDifficulty); if (move) finishBoardMove(room, move, bot.color); return; }
+    if (room.gameType === 'chinese-checkers') {
+      try {
+        const move = boardGames.chooseChineseCheckersMove(room.game, bot.color, room.botDifficulty);
+        if (!move || move.endTurn) { room.game.meta.forcedFrom = null; room.game.meta.hopCount = 0; room.game.meta.hopVisited = []; room.game.turn = 3 - bot.color; emitState(room); }
+        else if (!finishBoardMove(room, move, bot.color)) throw new Error('机器人选出的棋步未通过规则校验。');
+      } catch (error) {
+        console.error('Chinese Checkers bot move failed:', error.message);
+        room.game.meta.forcedFrom = null; room.game.meta.hopCount = 0; room.game.meta.hopVisited = []; room.game.turn = 3 - bot.color; emitState(room);
+      }
+      return;
+    }
     const move = chooseBotMove(room); finishMove(room, move.x, move.y, bot.color);
   }, delay);
 }
@@ -165,15 +178,45 @@ function afterRoll(room) {
   if (room.players.some(p => p?.bot && p.color === 1)) scheduleBot(room);
 }
 function completeUndo(room, accept) {
-  if (accept) { const move = room.game.moves.pop(); room.game.board[move.y * SIZE + move.x] = 0; room.game.turn = move.color; }
+  if (accept) {
+    if (room.players.some(p => p?.bot)) {
+      if (room.botTimer) { clearTimeout(room.botTimer); room.botTimer = null; }
+      const humanColor = room.players.find(p => p && !p.bot)?.color;
+      if (humanColor && room.game.moves.some(move => move.color === humanColor)) {
+        let removedHumanMove = false;
+        while (room.game.moves.length) {
+          const move = room.game.moves[room.game.moves.length - 1];
+          if (removedHumanMove && move.color !== humanColor) break;
+          if (move.color === humanColor) removedHumanMove = true;
+          const previous = room.undoStack.pop();
+          if (!previous) break;
+          room.game = previous;
+        }
+      }
+    } else if (room.gameType && room.gameType !== 'gomoku') { const previous = room.undoStack.pop(); if (previous) room.game = previous; }
+    else { const move = room.game.moves.pop(); room.undoStack.pop(); room.game.board[move.y * SIZE + move.x] = 0; room.game.turn = move.color; }
+  }
   room.game.undo = null; emitState(room);
   if (room.game.phase === 'playing' && room.players.some(p => p?.bot && p.color === room.game.turn)) scheduleBot(room);
+}
+function finishBoardMove(room, move, color) {
+  const before = structuredClone(room.game), result = boardGames.applyBoardMove(room.game, move || {}, color);
+  if (!result.ok) return false;
+  room.game.moves.push(move.pass ? { pass: true, color } : { from: move.from, to: move.to, x: move.x, y: move.y, color });
+  room.undoStack.push(before); room.game.undo = null;
+  if (result.winner) { room.game.winner = result.winner; room.game.status = 'won'; room.game.phase = 'finished'; if (result.score) room.game.result = `黑 ${result.score[1]} : 白 ${result.score[2]}`; }
+  else if (result.draw) { room.game.status = 'draw'; room.game.phase = 'finished'; }
+  else if (!result.keepTurn) room.game.turn = 3 - color;
+  emitState(room);
+  if (room.game.phase === 'playing' && room.players.some(p => p?.bot && p.color === room.game.turn)) scheduleBot(room);
+  return true;
 }
 
 io.on('connection', socket => {
   socket.on('create', (data, done) => {
     let code; do { code = randomInt(0, 36 ** 5).toString(36).toUpperCase().padStart(5, '0'); } while (games.has(code));
-    const room = { code, players: [{ id: socket.id, name: String(data.name || '').trim().slice(0, 20), seat: 1, color: 0, bot: false }, null], game: freshGame(), botDifficulty: null, expiry: null, botTimer: null };
+    const gameType = ['gomoku','xiangqi','chess','go','checkers','chinese-checkers'].includes(data.gameType) ? data.gameType : 'gomoku';
+    const room = { code, gameType, players: [{ id: socket.id, name: String(data.name || '').trim().slice(0, 20), seat: 1, color: 0, bot: false }, null], game: gameType === 'gomoku' ? freshGame() : boardGames.createBoard(gameType), undoStack: [], botDifficulty: null, expiry: null, botTimer: null };
     games.set(code, room); socket.join(code); socket.data = { code, seat: 1, color: 0 };
     done?.({ ok: true, code, seat: 1 }); emitState(room);
   });
@@ -193,6 +236,7 @@ io.on('connection', socket => {
   socket.on('bot:join', (difficulty, done) => {
     const room = games.get(socket.data.code);
     if (!room || socket.data.seat !== 1) return done?.({ ok: false, error: '请先创建一个房间。' });
+    if (!['gomoku', 'xiangqi', 'chinese-checkers'].includes(room.gameType)) return done?.({ ok: false, error: '机器人目前支持五子棋、中国象棋和中国跳棋。' });
     if (room.players[1]) return done?.({ ok: false, error: '对手位置已被占用。' });
     if (!difficulties[difficulty]) return done?.({ ok: false, error: '机器人难度无效。' });
     room.players[1] = { id: null, name: `机器人（${difficulties[difficulty]}）`, seat: 2, color: 0, bot: true };
@@ -212,6 +256,17 @@ io.on('connection', socket => {
     const room = games.get(socket.data.code), color = socket.data.color;
     if (!room || room.game.phase !== 'playing' || room.game.status !== 'playing' || room.game.turn !== color || !Number.isInteger(x) || !Number.isInteger(y) || x < 0 || x >= SIZE || y < 0 || y >= SIZE || room.game.board[y * SIZE + x]) return;
     finishMove(room, x, y, color);
+  });
+  socket.on('board:move', move => {
+    const room = games.get(socket.data.code), color = socket.data.color;
+    if (!room || room.gameType === 'gomoku' || room.game.phase !== 'playing' || room.game.status !== 'playing' || room.game.turn !== color) return;
+    finishBoardMove(room, move, color);
+  });
+  socket.on('board:endturn', () => {
+    const room=games.get(socket.data.code),color=socket.data.color;
+    if(!room||room.gameType!=='chinese-checkers'||room.game.phase!=='playing'||room.game.status!=='playing'||room.game.turn!==color||!room.game.meta.forcedFrom)return;
+    room.game.meta.forcedFrom=null;room.game.meta.hopCount=0;room.game.meta.hopVisited=[];room.game.turn=3-color;emitState(room);
+    if(room.players.some(p=>p?.bot&&p.color===room.game.turn))scheduleBot(room);
   });
   socket.on('undo:req', () => {
     const room = games.get(socket.data.code);
